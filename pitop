@@ -1,0 +1,647 @@
+#!/bin/bash
+export LC_NUMERIC=C
+# LC_ALL overrides LC_CTYPE, so capture the caller's effective character locale
+# before clearing it.  This keeps UTF-8 detection honest without forcing every
+# session into C.UTF-8 (the SSH client's locale may not be UTF-8 at all).
+EFFECTIVE_LC_CTYPE=${LC_ALL:-${LC_CTYPE:-${LANG:-C}}}
+unset LC_ALL 2>/dev/null || true
+export LC_CTYPE="$EFFECTIVE_LC_CTYPE"
+
+# ================= Configuration =================
+REFRESH=0.5
+MAX_CONTENT_WIDTH=0       # 0 = use (almost) the full terminal width
+MAX_PROC_ROWS=8           # cap on the process list length
+PEAK_TEMP=0
+SORT_BY=1
+CORES=$(nproc)           # fallback only; live CPU rows come from /proc/stat
+
+# ================= Terminal capabilities (SSH-safe) =================
+ESC=$'\e'
+IS_TTY=0
+[[ -t 0 && -t 1 && ${TERM:-dumb} != dumb ]] && IS_TTY=1
+
+if (( ! IS_TTY )); then
+    echo "pitop: requires an interactive terminal (use 'ssh -t' with a supported TERM)" >&2
+    exit 1
+fi
+
+# Colors: prefer terminfo, but fall back to plain ANSI when the remote box
+# lacks a terminfo entry for the forwarded TERM (common over ssh).
+C_RESET="" C_BOLD="" C_WHITE="" C_GREEN="" C_YELLOW="" C_RED="" C_CYAN=""
+C_MAGENTA="" C_BLUE="" C_GREY=""
+if [[ -z ${NO_COLOR:-} ]]; then
+    have_colors=0
+    if command -v tput >/dev/null 2>&1; then
+        colors=$(tput colors 2>/dev/null || echo 0)
+        [[ "$colors" =~ ^[0-9]+$ ]] && (( colors > 0 )) && have_colors=1
+    fi
+    if (( have_colors )); then
+        C_RESET=$(tput sgr0 2>/dev/null || true)
+        C_BOLD=$(tput bold 2>/dev/null || true)
+        C_WHITE=$(tput setaf 7 2>/dev/null || true)
+        C_GREEN=$(tput setaf 2 2>/dev/null || true)
+        C_YELLOW=$(tput setaf 3 2>/dev/null || true)
+        C_RED=$(tput setaf 1 2>/dev/null || true)
+        C_CYAN=$(tput setaf 6 2>/dev/null || true)
+        C_MAGENTA=$(tput setaf 5 2>/dev/null || true)
+        C_BLUE=$(tput setaf 4 2>/dev/null || true)
+        C_GREY=$(tput setaf 8 2>/dev/null || true)
+        [[ -z "$C_GREY" ]] && C_GREY=$C_WHITE
+    elif [[ $TERM == xterm* || $TERM == screen* || $TERM == tmux* || $TERM == rxvt* ||
+            $TERM == ansi*  || $TERM == linux* || $TERM == alacritty* || $TERM == kitty* ||
+            $TERM == wezterm* || $TERM == konsole* || $TERM == st* || $TERM == foot* ||
+            $TERM == eterm* ]]; then
+        C_RESET=$'\e[0m'     C_BOLD=$'\e[1m'
+        C_WHITE=$'\e[37m'    C_GREEN=$'\e[32m'   C_YELLOW=$'\e[33m'
+        C_RED=$'\e[31m'      C_CYAN=$'\e[36m'    C_MAGENTA=$'\e[35m'
+        C_BLUE=$'\e[34m'     C_GREY=$'\e[2;37m'
+    fi
+fi
+
+# Reusable role colors.
+C_LABEL="${C_BOLD}${C_WHITE}"    # section/field labels
+C_SEP="${C_BOLD}${C_BLUE}"       # section separators
+C_BORDER="$C_GREY"               # frame lines
+C_OK="${C_BOLD}${C_GREEN}"       # healthy values
+
+CLR_EOL=$(tput el 2>/dev/null || true);       [[ -z "$CLR_EOL" ]] && CLR_EOL="${ESC}[K"
+CLR_EOS=$(tput ed 2>/dev/null || true);       [[ -z "$CLR_EOS" ]] && CLR_EOS="${ESC}[J"
+CLR_HOME=$(tput home 2>/dev/null || true);    [[ -z "$CLR_HOME" ]] && CLR_HOME="${ESC}[H"
+CLR_SCREEN="${ESC}[2J"   # avoid tput clear's scrollback wipe on xterm-like TERMs
+
+SM_CUP=$(tput smcup 2>/dev/null || true);     [[ -z "$SM_CUP" ]] && SM_CUP=$'\e[?1049h'
+RM_CUP=$(tput rmcup 2>/dev/null || true);     [[ -z "$RM_CUP" ]] && RM_CUP=$'\e[?1049l'
+CUR_HIDE=$(tput civis 2>/dev/null || true);   [[ -z "$CUR_HIDE" ]] && CUR_HIDE=$'\e[?25l'
+CUR_SHOW=$(tput cnorm 2>/dev/null || true);   [[ -z "$CUR_SHOW" ]] && CUR_SHOW=$'\e[?25h'
+
+# Rates are measured per REFRESH tick; bash arithmetic needs an integer scale.
+RATE_MULT=$(awk -v r="$REFRESH" 'BEGIN { printf "%.0f", 1 / r }')
+[[ "$RATE_MULT" =~ ^[0-9]+$ ]] || RATE_MULT=1
+(( RATE_MULT < 1 )) && RATE_MULT=1
+
+# Box drawing only when the caller's effective locale really is UTF-8.
+probe='─'
+if (( ${#probe} == 1 )); then
+    CH_H='─' CH_TL='┌' CH_TR='┐' CH_BL='└' CH_BR='┘'
+    CH_D='▼' CH_U='▲' CH_ELL='…' CH_DEG='°'
+else
+    CH_H='-' CH_TL='+' CH_TR='+' CH_BL='+' CH_BR='+'
+    CH_D='v' CH_U='^' CH_ELL='...' CH_DEG=''
+fi
+
+# ================= Cleanup =================
+CLEANED=0
+cleanup() {
+    (( CLEANED )) && return
+    CLEANED=1
+    printf '%s%s%s' "$C_RESET" "$CUR_SHOW" "$RM_CUP"
+}
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+trap 'exit 129' HUP
+trap ':' WINCH   # resizes are picked up by the geometry check below (<= REFRESH)
+
+printf '%s%s' "$SM_CUP" "$CUR_HIDE"
+
+# ================= Auto-detection =================
+NET_IFACE=$(ip route show default 2>/dev/null | awk '{print $5; exit}')
+[[ -z "$NET_IFACE" ]] && NET_IFACE=$(ip -o link show 2>/dev/null | awk -F': ' '$2 != "lo" {print $2; exit}')
+
+# ================= Helpers =================
+repeat_char() {
+    local n=$1 c=$2 s=""
+    while (( n-- > 0 )); do s+=$c; done
+    REPEAT=$s
+}
+
+# Set global VIS to the visible length of the string (ANSI ignored).
+calc_vis() {
+    local s=$1
+    local n=${#s} i=0 c
+    VIS=0
+    while (( i < n )); do
+        c=${s:i:1}
+        if [[ $c == $'\e' ]]; then
+            (( i++ ))
+            while (( i < n )); do
+                c=${s:i:1}
+                (( i++ ))
+                [[ $c == [a-zA-Z] ]] && break
+            done
+        else
+            (( VIS++, i++ ))
+        fi
+    done
+}
+
+# Truncate to at most $max visible chars, append ellipsis.  Result in $TRUNC.
+TRUNC=""
+truncate_ansi() {
+    local max=$1 s=$2
+    local n=${#s} i=0 c len=0 out=""
+    while (( i < n )); do
+        c=${s:i:1}
+        if [[ $c == $'\e' ]]; then
+            out+=$c
+            (( i++ ))
+            while (( i < n )); do
+                c=${s:i:1}
+                out+=$c
+                (( i++ ))
+                [[ $c == [a-zA-Z] ]] && break
+            done
+        else
+            if (( len >= max - 1 )); then
+                out+="${C_RESET}${CH_ELL}"
+                break
+            fi
+            out+=$c
+            (( len++, i++ ))
+        fi
+    done
+    TRUNC=$out
+}
+
+draw_bar() {
+    local pct=${1%.*} char=$2 color=$3
+    (( pct >= 85 )) && color=$C_RED
+    (( pct < 0 ))  && pct=0
+    (( pct > 100 )) && pct=100
+    local filled=$(( pct * BAR_WIDTH / 100 ))
+    local empty=$(( BAR_WIDTH - filled ))
+    local i
+    BAR="[${color}"
+    for ((i=0; i<filled; i++)); do BAR+=$char; done
+    BAR+=$C_GREY
+    for ((i=0; i<empty; i++)); do BAR+="."; done
+    BAR+="${C_RESET}]"
+}
+
+human_readable() {
+    local v=${1:-0}
+    if (( v >= 1073741824 )); then
+        HUMAN="$(( v / 1073741824 )).$(( (v % 1073741824) * 10 / 1073741824 ))G"
+    elif (( v >= 1048576 )); then
+        HUMAN="$(( v / 1048576 ))M"
+    elif (( v >= 1024 )); then
+        HUMAN="$(( v / 1024 ))K"
+    else
+        HUMAN="${v}B"
+    fi
+}
+
+fmt_temp() {
+    if [[ $1 =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+        printf '%s%sC' "$1" "$CH_DEG"
+    else
+        printf 'N/A'
+    fi
+}
+
+shorten() {
+    local s=$1 max=$2 elln=${#CH_ELL}
+    if (( ${#s} > max )); then
+        SHORT="${s:0:max-elln}${CH_ELL}"
+    else
+        SHORT=$s
+    fi
+}
+
+pct_style() {
+    local p=$1
+    if (( p >= 85 )); then
+        PCT_COLOR="${C_BOLD}${C_RED}"
+    elif (( p >= 70 )); then
+        PCT_COLOR="${C_BOLD}${C_YELLOW}"
+    else
+        PCT_COLOR="${C_BOLD}${C_GREEN}"
+    fi
+}
+
+# A standalone Esc quits; arrow/function-key sequences are drained by the
+# input loop.  Any other key that follows Esc is handled as a normal keypress
+# so a fast Esc+c cannot be swallowed by the escape-sequence detection.
+handle_key() {
+    case "$1" in
+        c|C) SORT_BY=1 ;;
+        m|M) SORT_BY=2 ;;
+    esac
+}
+
+# Disk rows: filesystem label (or device name), filesystem, used/total and usage %.
+# Cached because lsblk/df are slow compared with the 0.5 s screen refresh.
+refresh_disks() {
+    disk_lines=()
+    local sed_expr
+    sed_expr=$'s/.*NAME="([^"]*)" FSTYPE="([^"]*)" '
+    sed_expr+=$'SIZE="([^"]*)" LABEL="([^"]*)" '
+    sed_expr+=$'MOUNTPOINTS="([^"]*)".*/\\1\\x1f\\2\\x1f\\3\\x1f\\4\\x1f\\5/'
+    while IFS=$'\x1f' read -r dev fs size label mnt; do
+        [[ -z "$dev" || "$dev" =~ loop|zram|sr0 ]] && continue
+        [[ -z "$fs" ]] && continue
+        [[ -z "$mnt" ]] && continue
+        disk_name=${label:-$dev}
+        shorten "$disk_name" 16; disk_s=$SHORT
+        human_readable "$size"; size_h=$HUMAN
+        dsk_prefix=" ${C_LABEL}DSK${C_RESET} [${C_CYAN}${disk_s}${C_RESET}] ${C_MAGENTA}${fs}${C_RESET}"
+        if [[ -n "$mnt" && "$mnt" != "[SWAP]" ]]; then
+            mnt=${mnt%%,*}
+            read -r total used pct < <(
+                timeout 2 df -P -B1 "$mnt" 2>/dev/null |
+                awk 'NR==2 {gsub(/%/,"",$5); print $2, $3, $5}'
+            )
+            if [[ "$total" =~ ^[0-9]+$ && "$used" =~ ^[0-9]+$ ]]; then
+                human_readable "$total"; size_h=$HUMAN
+                human_readable "$used"; used_h=$HUMAN
+                if [[ "$pct" =~ ^[0-9]+$ ]]; then
+                    pct_style "$pct"
+                    disk_lines+=("${dsk_prefix} ${used_h}/${size_h} ${PCT_COLOR}${pct}%${C_RESET}")
+                else
+                    disk_lines+=("${dsk_prefix} ${used_h}/${size_h}")
+                fi
+                continue
+            fi
+        fi
+        if [[ "$mnt" == "[SWAP]" ]]; then
+            disk_lines+=("${dsk_prefix} ${size_h} ${C_GREY}[SWAP]${C_RESET}")
+        fi
+    done < <(
+        lsblk -b -P -o NAME,FSTYPE,SIZE,LABEL,MOUNTPOINTS 2>/dev/null |
+        sed -E "$sed_expr" |
+        awk -F'\037' '!seen[$1]++'
+    )
+}
+
+sep_line() {
+    local title=$1 rem
+    rem=$(( CONTENT_WIDTH - ${#title} - 5 ))
+    (( rem < 1 )) && rem=1
+    repeat_char "$rem" "$CH_H"
+    SEP="${C_SEP}${CH_H}${CH_H}${CH_H} ${title} ${REPEAT}${C_RESET}"
+}
+
+# ================= State =================
+declare -A PREV_CORE_T PREV_CORE_I
+HB_IDX=0
+PREV_COLS=0
+PREV_ROWS=0
+TERM_COLS=80
+TERM_ROWS=24
+NEXT_UPTIME=0
+up_time=""
+NEXT_RP1=0
+NEXT_DISKS=0
+DISK_INFO_INTERVAL=10
+disk_lines=()
+rp1_temp="N/A"
+rp1_found=0
+
+if [[ -n "$NET_IFACE" ]]; then
+    PREV_RX=$(<"/sys/class/net/$NET_IFACE/statistics/rx_bytes")
+    PREV_TX=$(<"/sys/class/net/$NET_IFACE/statistics/tx_bytes")
+    PREV_RX=${PREV_RX:-0}
+    PREV_TX=${PREV_TX:-0}
+else
+    PREV_RX=0; PREV_TX=0
+fi
+
+while read -r name rest; do
+    [[ "$name" == cpu* ]] || continue
+    stats=($rest)
+    total=0
+    # /proc/stat guest/guest_nice are already included in user/nice; counting
+    # them again would inflate the computed CPU usage.
+    for ((si = 0; si < 8 && si < ${#stats[@]}; si++)); do
+        (( total += stats[si] ))
+    done
+    PREV_CORE_T[$name]=$total
+    PREV_CORE_I[$name]=$(( stats[3] + stats[4] ))
+done < /proc/stat
+
+# ================= Main loop =================
+while true; do
+
+    # ---- Input ----
+    if read -rsn 1 -t 0.05 key; then
+        if [[ $key == $'\e' ]]; then
+            # Distinguish a standalone Esc from an escape sequence, but do not
+            # discard a normal key pressed immediately after Esc.
+            if read -rsn 1 -t 0.05 next; then
+                if [[ $next == '[' || $next == 'O' ]]; then
+                    while read -rsn 1 -t 0.01 _; do :; done
+                else
+                    handle_key "$next"
+                fi
+            else
+                exit 0
+            fi
+        else
+            handle_key "$key"
+        fi
+    fi
+
+    # ---- Geometry ----
+    if read -r _rows _cols < <(stty size </dev/tty 2>/dev/null) &&
+       [[ "$_rows" =~ ^[1-9][0-9]*$ && "$_cols" =~ ^[1-9][0-9]*$ ]]; then
+        TERM_ROWS=$_rows
+        TERM_COLS=$_cols
+    elif [[ ${COLUMNS:-} =~ ^[1-9][0-9]*$ && ${LINES:-} =~ ^[1-9][0-9]*$ ]]; then
+        TERM_ROWS=$LINES
+        TERM_COLS=$COLUMNS
+    fi
+    (( TERM_COLS < 10 )) && TERM_COLS=10
+    (( TERM_ROWS < 5 ))  && TERM_ROWS=5
+
+    if (( TERM_COLS != PREV_COLS || TERM_ROWS != PREV_ROWS )); then
+        printf '%s%s' "$CLR_SCREEN" "$CLR_HOME"
+        PREV_COLS=$TERM_COLS
+        PREV_ROWS=$TERM_ROWS
+    fi
+
+    CONTENT_WIDTH=$(( TERM_COLS - 1 ))
+    if (( MAX_CONTENT_WIDTH > 0 && CONTENT_WIDTH > MAX_CONTENT_WIDTH )); then
+        CONTENT_WIDTH=$MAX_CONTENT_WIDTH
+    fi
+    PAD=$(( (TERM_COLS - CONTENT_WIDTH) / 2 ))
+    (( PAD < 0 )) && PAD=0
+
+    BAR_WIDTH=$(( CONTENT_WIDTH - 20 ))
+    (( BAR_WIDTH > 60 )) && BAR_WIDTH=60
+    (( BAR_WIDTH < 6 ))  && BAR_WIDTH=6
+
+    # ---- Metrics ----
+    temp_raw=$(vcgencmd measure_temp 2>/dev/null)
+    temp_raw=${temp_raw#*=}
+    temp_raw=${temp_raw%\'*}
+    TEMP_VALID=0
+    if [[ "$temp_raw" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+        TEMP_VALID=1
+        awk -v a="$temp_raw" -v b="$PEAK_TEMP" 'BEGIN{exit !(a+0 > b+0)}' && PEAK_TEMP=$temp_raw
+    else
+        temp_raw="N/A"
+    fi
+
+    pmic_temp=$(vcgencmd measure_temp pmic 2>/dev/null)
+    pmic_temp=${pmic_temp#*=}
+    pmic_temp=${pmic_temp%\'*}
+    [[ -z "$pmic_temp" ]] && pmic_temp="N/A"
+
+    if (( SECONDS >= NEXT_RP1 )); then
+        rp1_temp=""
+        rp1_found=0
+        while IFS= read -r line; do
+            case "$line" in
+                *rp1_adc-isa*) rp1_found=1 ;;
+            esac
+            if (( rp1_found )) && [[ "$line" == *temp1:* ]]; then
+                rp1_temp=${line#*temp1:}
+                rp1_temp=${rp1_temp%%°C*}
+                rp1_temp=${rp1_temp//[+ ]/}
+                break
+            fi
+        done < <(sensors 2>/dev/null)
+        [[ -z "$rp1_temp" ]] && rp1_temp="N/A"
+        NEXT_RP1=$(( SECONDS + 5 ))
+    fi
+
+    clock=$(vcgencmd measure_clock arm 2>/dev/null)
+    clock=${clock#*=}
+    if [[ "$clock" =~ ^[0-9]+$ ]]; then
+        clock=$(( clock / 1000000 ))
+    else
+        clock="?"
+    fi
+
+    volts=$(vcgencmd measure_volts core 2>/dev/null)
+    volts=${volts#*=}
+    [[ -z "$volts" ]] && volts="?"
+
+    hex=$(vcgencmd get_throttled 2>/dev/null)
+    hex=${hex#*=}
+    [[ "$hex" =~ ^0x[0-9a-fA-F]+$ ]] || hex=0x0
+    val=$((hex))
+    status="${C_OK}HEALTHY${C_RESET}"
+    if (( (val & 0x8) || (val & 0x4) || (val & 0x2) )); then
+        status="${C_BOLD}${C_RED}THROTTLED${C_RESET}"
+    elif (( val & 0x1 )); then
+        status="${C_BOLD}${C_RED}LOW VOLT${C_RESET}"
+    fi
+
+    # Network rates
+    if [[ -n "$NET_IFACE" ]]; then
+        rx=$(<"/sys/class/net/$NET_IFACE/statistics/rx_bytes")
+        tx=$(<"/sys/class/net/$NET_IFACE/statistics/tx_bytes")
+        rx=${rx:-0}; tx=${tx:-0}
+    else
+        rx=0; tx=0
+    fi
+    rx_rate=$(( rx - PREV_RX )); (( rx_rate < 0 )) && rx_rate=0
+    tx_rate=$(( tx - PREV_TX )); (( tx_rate < 0 )) && tx_rate=0
+    PREV_RX=$rx; PREV_TX=$tx
+
+    # Disk usage (cached; lsblk/df are too slow for every frame)
+    if (( SECONDS >= NEXT_DISKS )); then
+        refresh_disks
+        NEXT_DISKS=$(( SECONDS + DISK_INFO_INTERVAL ))
+    fi
+
+    # Memory
+    read -r t_mem a_mem t_swap f_swap < <(
+        awk '/^MemTotal/ {t=$2} /^MemAvailable/ {a=$2} /^SwapTotal/ {st=$2} /^SwapFree/ {sf=$2}
+             END {print t+0, a+0, st+0, sf+0}' /proc/meminfo
+    )
+    mem_used=$(( t_mem - a_mem ))
+    mem_pct=0
+    (( t_mem > 0 )) && mem_pct=$(( mem_used * 100 / t_mem ))
+    has_swap=0
+    (( t_swap > 0 )) && has_swap=1
+    avail_ram=$(( a_mem / 1024 ))
+
+    # CPU usage
+    cpu_lines=()
+    while read -r line; do
+        name=${line%% *}
+        [[ "$name" == cpu* ]] || continue
+        stats=(${line#* })
+        total=0
+        for ((si = 0; si < 8 && si < ${#stats[@]}; si++)); do
+            (( total += stats[si] ))
+        done
+        idle=$(( stats[3] + stats[4] ))
+        pt=${PREV_CORE_T[$name]:-$total}
+        pi=${PREV_CORE_I[$name]:-$idle}
+        d_total=$(( total - pt ))
+        d_idle=$(( idle - pi ))
+        usage=0
+        (( d_total > 0 )) && usage=$(( 100 * (d_total - d_idle) / d_total ))
+        PREV_CORE_T[$name]=$total
+        PREV_CORE_I[$name]=$idle
+
+        if [[ "$name" == "cpu" ]]; then
+            label="TOTAL"; char="|"
+        else
+            label="CPU${name#cpu}"; char="*"
+        fi
+        printf -v label_fmt '%-5s' "$label"
+        printf -v usage_fmt '%3d%%' "$usage"
+        pct_style "$usage"
+        draw_bar "$usage" "$char" "$C_GREEN"
+        cpu_lines+=(" ${C_LABEL}${label_fmt}${C_RESET} : ${BAR} ${PCT_COLOR}${usage_fmt}${C_RESET}")
+    done < /proc/stat
+
+    # Use the rows we actually rendered, not nproc, for both layout and CPU
+    # normalization.  nproc can disagree with /proc/stat after CPU hotplug or
+    # when the process is running under a restricted CPU affinity mask.
+    cpu_rows=${#cpu_lines[@]}
+    CPU_COUNT=$(( cpu_rows > 1 ? cpu_rows - 1 : CORES ))
+    (( CPU_COUNT < 1 )) && CPU_COUNT=1
+
+    # ---- Decide vertical layout ----
+    n_disks=${#disk_lines[@]}
+    show_disks=1
+    show_swap=$has_swap
+
+    # 10 fixed lines + process header + disks + actual CPU rows + swap
+    base=$(( 11 + n_disks + cpu_rows + show_swap ))
+    proc_rows=$(( TERM_ROWS - base ))
+
+    if (( proc_rows < 0 && show_swap )); then
+        show_swap=0
+        base=$(( base - 1 ))
+        proc_rows=$(( TERM_ROWS - base ))
+    fi
+
+    if (( proc_rows < 0 && n_disks > 0 )); then
+        # Keep as many disk rows as fit instead of hiding them all.
+        n_disks=$(( n_disks + proc_rows ))
+        (( n_disks < 1 )) && n_disks=1
+        base=$(( 11 + n_disks + cpu_rows + show_swap ))
+        proc_rows=$(( TERM_ROWS - base ))
+    fi
+    show_disks=$(( n_disks > 0 ))
+
+    (( proc_rows < 0 )) && proc_rows=0
+    (( proc_rows > MAX_PROC_ROWS )) && proc_rows=$MAX_PROC_ROWS
+
+    show_proc=1
+    (( proc_rows <= 0 )) && show_proc=0
+
+    if (( SORT_BY == 1 )); then SORT_LABEL="CPU%"; else SORT_LABEL="MEM%"; fi
+
+    proc_lines=()
+    if (( show_proc )); then
+        printf -v proc_header '%s%-22s %7s %7s%s' \
+            "${C_BOLD}${C_YELLOW}" "PROCESS (GROUPED: $SORT_LABEL)" \
+            "CPU%" "MEM%" "$C_RESET"
+        while IFS= read -r pl; do
+            proc_lines+=("${C_WHITE}${pl}${C_RESET}")
+        done < <(
+            ps -eo comm,pcpu,pmem --no-headers 2>/dev/null |
+            awk -v cores="$CPU_COUNT" '{cpu[$1]+=$2/cores; mem[$1]+=$3}
+                END {for (p in cpu) printf "%-22.22s %7.1f%% %7.1f%%\n", p, cpu[p], mem[p]}' |
+            sort -rnk $((SORT_BY + 1)) | head -n "$proc_rows"
+        )
+    fi
+
+    # ---- Build the frame ----
+    OUT_LINES=()
+
+    banner_inner=$(( CONTENT_WIDTH - 2 ))
+    (( banner_inner < 1 )) && banner_inner=1
+    repeat_char "$banner_inner" "$CH_H"
+    hline=$REPEAT
+    OUT_LINES+=("${C_BORDER}${CH_TL}${hline}${CH_TR}${C_RESET}")
+
+    if (( SECONDS >= NEXT_UPTIME )); then
+        up_time=$(uptime -p 2>/dev/null)
+        up_time=${up_time#up }
+        NEXT_UPTIME=$(( SECONDS + 60 ))
+    fi
+    printf -v now '%(%H:%M:%S)T' -1
+    hb=("-" "\\" "|" "/")
+    banner_line="  ${C_LABEL}RPI-5 MONITOR${C_RESET} | ${C_CYAN}${now}${C_RESET}"
+    banner_line+=" | ${C_LABEL}Up:${C_RESET} ${C_GREY}${up_time}${C_RESET}"
+    banner_line+=" | ${C_LABEL}HB:${C_RESET} ${C_YELLOW}${hb[HB_IDX]}${C_RESET}"
+    OUT_LINES+=("$banner_line")
+    OUT_LINES+=("${C_BORDER}${CH_BL}${hline}${CH_BR}${C_RESET}")
+
+    cpu_temp=$(fmt_temp "$temp_raw")
+    peak_temp="N/A"
+    (( TEMP_VALID )) && peak_temp=$(fmt_temp "$PEAK_TEMP")
+    if [[ "$clock" =~ ^[0-9]+$ ]]; then clock_s="${clock}MHz"; else clock_s="N/A"; fi
+    pmic_s=$(fmt_temp "$pmic_temp")
+    rp1_s=$(fmt_temp "$rp1_temp")
+    cpu_line=" ${C_LABEL}CPU:${C_RESET} ${C_YELLOW}${cpu_temp}${C_RESET}"
+    cpu_line+=" (${C_LABEL}Peak:${C_RESET} ${C_YELLOW}${peak_temp}${C_RESET})"
+    cpu_line+=" | ${C_LABEL}Freq:${C_RESET} ${C_CYAN}${clock_s}${C_RESET} | ${status}"
+    OUT_LINES+=("$cpu_line")
+    pmic_line=" ${C_LABEL}PMIC:${C_RESET} ${C_MAGENTA}${pmic_s}${C_RESET}"
+    pmic_line+=" | ${C_LABEL}RP1:${C_RESET} ${C_MAGENTA}${rp1_s}${C_RESET}"
+    pmic_line+=" | ${C_LABEL}VCore:${C_RESET} ${C_CYAN}${volts}${C_RESET}"
+    pmic_line+=" | ${C_LABEL}Avail:${C_RESET} ${C_WHITE}${avail_ram}MB${C_RESET}"
+    OUT_LINES+=("$pmic_line")
+
+    sep_line 'Disks & Network'
+    OUT_LINES+=("$SEP")
+    human_readable "$(( rx_rate * RATE_MULT ))"; rx_h=$HUMAN
+    human_readable "$(( tx_rate * RATE_MULT ))"; tx_h=$HUMAN
+    net_line=" ${C_LABEL}NET${C_RESET} [${C_CYAN}${NET_IFACE:-none}${C_RESET}]:"
+    net_line+=" ${C_GREEN}${CH_D} ${rx_h}/s${C_RESET}"
+    net_line+="  ${C_CYAN}${CH_U} ${tx_h}/s${C_RESET}"
+    OUT_LINES+=("$net_line")
+
+    if (( show_disks )); then
+        for ((i = 0; i < n_disks; i++)); do OUT_LINES+=("${disk_lines[i]}"); done
+    fi
+
+    sep_line 'CPU & Memory'
+    OUT_LINES+=("$SEP")
+    for cl in "${cpu_lines[@]}"; do OUT_LINES+=("$cl"); done
+
+    pct_style "$mem_pct"
+    draw_bar "$mem_pct" "#" "$C_CYAN"
+    ram_line=" ${C_LABEL}RAM${C_RESET}   : ${BAR}"
+    ram_line+=" ${C_WHITE}$((mem_used/1024))/$((t_mem/1024)) MB${C_RESET}"
+    ram_line+=" ${PCT_COLOR}${mem_pct}%${C_RESET}"
+    OUT_LINES+=("$ram_line")
+
+    if (( show_swap )); then
+        sw_used=$(( t_swap - f_swap ))
+        sw_pct=$(( sw_used * 100 / t_swap ))
+        pct_style "$sw_pct"
+        draw_bar "$sw_pct" "+" "$C_MAGENTA"
+        swap_line=" ${C_LABEL}SWAP${C_RESET}  : ${BAR}"
+        swap_line+=" ${C_WHITE}$((sw_used/1024))/$((t_swap/1024)) MB${C_RESET}"
+        swap_line+=" ${PCT_COLOR}${sw_pct}%${C_RESET}"
+        OUT_LINES+=("$swap_line")
+    fi
+
+    if (( show_proc )); then
+        OUT_LINES+=("$proc_header")
+        for pl in "${proc_lines[@]}"; do OUT_LINES+=("$pl"); done
+    fi
+
+    OUT_LINES+=("${C_GREY}Keys: [c] CPU Sort | [m] Mem Sort | [Esc] Quit${C_RESET}")
+
+    # ---- Render (never more lines than the terminal can hold) ----
+    nlines=${#OUT_LINES[@]}
+    (( nlines > TERM_ROWS )) && nlines=$TERM_ROWS
+
+    printf '%s' "$CLR_HOME"
+    for (( row=0; row<nlines; row++ )); do
+        (( row > 0 )) && printf '\n'
+        printf '\r'
+        l=${OUT_LINES[row]}
+        calc_vis "$l"
+        if (( VIS > CONTENT_WIDTH )); then
+            truncate_ansi "$CONTENT_WIDTH" "$l"
+            l=$TRUNC
+        fi
+        printf "%*s%s%s" "$PAD" "" "$l" "$CLR_EOL"
+    done
+    printf '%s' "$CLR_EOS"
+
+    HB_IDX=$(( (HB_IDX + 1) % 4 ))
+    sleep "$REFRESH"
+done
